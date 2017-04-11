@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +44,8 @@ func handleSerial(s *serial.Port, recvChan chan string, sendChan chan string) {
 				log.Println("Error:", err)
 			}
 			log.Printf("%q", s)
+			s = strings.Replace(s, "\n", "", -1)
+			s = strings.Replace(s, "\r", "", -1)
 			recvChan <- s
 		}
 		// wg.Done() // TODO: unreachable
@@ -108,15 +112,82 @@ func handleConnected(recvChan chan string, sendChan chan string, c mqtt.Client) 
 	c.Subscribe("gateway/rfm69/send", 0, mqtt.MessageHandler(func(c mqtt.Client, m mqtt.Message) {
 		sendChan <- string(m.Payload())
 	}))
+	sendMsg := func(topic string, msg []byte) {
+		t := c.Publish(topic, 0, false, msg)
+		if !t.WaitTimeout(3 * time.Second) {
+			log.Println("Action not completed")
+			if err := t.Error(); err != nil {
+				log.Println("Error: ", err)
+			}
+		}
+	}
 	go func() {
 		for recv := range recvChan {
-			t := c.Publish("gateway/rfm69/recv", 0, false, []byte(recv))
-			if !t.WaitTimeout(3 * time.Second) {
-				log.Println("Action not completed")
-				if err := t.Error(); err != nil {
+			if len(recv) > 1 && recv[0] == '>' {
+				data, err := parseReceived(recv[1:])
+				if err != nil {
 					log.Println("Error: ", err)
+					sendMsg("gateway/rfm69", []byte(recv))
+					continue
 				}
+				b, err := json.Marshal(data)
+				if err != nil {
+					log.Println("Error: ", err)
+					sendMsg("gateway/rfm69/recv", []byte(recv))
+					continue
+				}
+				sendMsg("gateway/rfm69/recv/"+strconv.Itoa(data.Sender), b)
+			} else {
+				sendMsg("gateway/rfm69", []byte(recv))
 			}
 		}
 	}()
+}
+
+type recvData struct {
+	Sender       int                    `json:"sender"`
+	RSSI         int                    `json:"rssi"`
+	AckRequested bool                   `json:"ack_req"`
+	Message      map[string]interface{} `json:"msg"`
+}
+
+func parseReceived(s string) (*recvData, error) {
+	if len(s) == 0 {
+		return nil, fmt.Errorf("Invalid input string")
+	}
+	metaNmsg := strings.SplitN(s, "|", 2)
+	if len(metaNmsg) != 2 {
+		return nil, fmt.Errorf("Could not split meta and message")
+	}
+	metaParts := strings.Split(metaNmsg[0], ",")
+	meta := &recvData{
+		Message: make(map[string]interface{}),
+	}
+	for _, metaPart := range metaParts {
+		parts := strings.SplitN(metaPart, ":", 2)
+		switch parts[0] {
+		case "s":
+			meta.Sender, _ = strconv.Atoi(parts[1])
+		case "rssi":
+			meta.RSSI, _ = strconv.Atoi(parts[1])
+		case "ackreq":
+			if parts[1] == "1" {
+				meta.AckRequested = true
+			}
+		}
+	}
+	if metaNmsg[1][0] == '!' {
+		meta.Message["register"] = true
+	} else {
+		msgParts := strings.Split(metaNmsg[1], "|")
+		for _, msgPart := range msgParts {
+			keyValue := strings.SplitN(msgPart, ":", 2)
+			if n, err := strconv.Atoi(keyValue[1]); err == nil {
+				meta.Message[keyValue[0]] = n
+			} else {
+				meta.Message[keyValue[0]] = keyValue[1]
+			}
+		}
+	}
+	return meta, nil
 }
