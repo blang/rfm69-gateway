@@ -1,1 +1,1 @@
-GOARCH=arm GOARM=5 go build
+GOARCH=arm GOARM=7 go build
